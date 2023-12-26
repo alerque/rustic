@@ -14,6 +14,7 @@ pub(crate) mod key;
 pub(crate) mod list;
 pub(crate) mod ls;
 pub(crate) mod merge;
+pub(crate) mod mount;
 pub(crate) mod prune;
 pub(crate) mod repair;
 pub(crate) mod repoinfo;
@@ -31,9 +32,10 @@ use crate::{
     commands::{
         backup::BackupCmd, cat::CatCmd, check::CheckCmd, completions::CompletionsCmd,
         config::ConfigCmd, copy::CopyCmd, diff::DiffCmd, dump::DumpCmd, forget::ForgetCmd,
-        init::InitCmd, key::KeyCmd, list::ListCmd, ls::LsCmd, merge::MergeCmd, prune::PruneCmd,
-        repair::RepairCmd, repoinfo::RepoInfoCmd, restore::RestoreCmd, self_update::SelfUpdateCmd,
-        show_config::ShowConfigCmd, snapshots::SnapshotCmd, tag::TagCmd,
+        init::InitCmd, key::KeyCmd, list::ListCmd, ls::LsCmd, merge::MergeCmd, mount::MountCmd,
+        prune::PruneCmd, repair::RepairCmd, repoinfo::RepoInfoCmd, restore::RestoreCmd,
+        self_update::SelfUpdateCmd, show_config::ShowConfigCmd, snapshots::SnapshotCmd,
+        tag::TagCmd,
     },
     config::{progress_options::ProgressOptions, RepoOptions, RusticConfig},
     {Application, RUSTIC_APP},
@@ -90,6 +92,9 @@ enum RusticCmd {
 
     /// Manage keys
     Key(KeyCmd),
+
+    /// Mount repository
+    Mount(MountCmd),
 
     /// List repository files
     List(ListCmd),
