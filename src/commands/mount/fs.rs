@@ -118,7 +118,7 @@ impl<P, S: IndexedFull> FilesystemMT for RusticFS<P, S> {
         let node = self.node_from_path(path)?;
         let open = self.repo.open_file(&node).map_err(|_| libc::ENOSYS)?;
         let mut open_files = self.open_files.write().unwrap();
-        let fh = open_files.first_key_value().map(|(fh, _)| *fh).unwrap_or(0);
+        let fh = open_files.last_key_value().map(|(fh, _)| *fh + 1).unwrap_or(0);
         _ = open_files.insert(fh, open);
         Ok((fh, 0))
     }
