@@ -90,6 +90,7 @@ jemallocator-global = { version = "0.3.2", optional = true }
 mimalloc = { version = "0.1.39", default_features = false, optional = true }
 rhai = { workspace = true }
 simplelog = { workspace = true }
+runtime-format = "0.1.3"
 
 [dev-dependencies]
 abscissa_core = { workspace = true, features = ["testing"] }

@@ -1,222 +1,229 @@
-#[cfg(not(windows))]
-use std::os::unix::prelude::OsStrExt;
 use std::{
     collections::BTreeMap,
-    ffi::{CString, OsStr},
-    path::Path,
-    sync::RwLock,
-    time::{Duration, SystemTime},
+    ffi::{OsStr, OsString},
+    path::{Component, Path, PathBuf},
 };
 
-use fuse_mt::{
-    CallbackResult, DirectoryEntry, FileAttr, FileType, FilesystemMT, RequestInfo, ResultData,
-    ResultEmpty, ResultEntry, ResultOpen, ResultReaddir, ResultSlice, ResultXattr, Xattr,
-};
-use itertools::Itertools;
-use rustic_core::{
-    repofile::{Node, NodeType},
-    OpenFile,
-};
+use anyhow::{anyhow, bail};
+use runtime_format::FormatArgs;
+use rustic_core::repofile::{Metadata, Node, NodeType, SnapshotFile};
 use rustic_core::{Id, IndexedFull, Repository};
 
-pub(super) struct RusticFS<P, S> {
-    repo: Repository<P, S>,
-    root: Id,
-    open_files: RwLock<BTreeMap<u64, OpenFile>>,
-    now: SystemTime,
+use super::format::FormattedSnapshot;
+
+pub enum IdenticalSnapshot {
+    AsLink,
+    AsDir,
 }
 
-impl<P, S: IndexedFull> RusticFS<P, S> {
-    pub(crate) fn from_node(repo: Repository<P, S>, node: Node) -> anyhow::Result<Self> {
-        let open_files = RwLock::new(BTreeMap::new());
-
-        Ok(Self {
-            repo,
-            root: node.subtree.unwrap(),
-            open_files,
-            now: SystemTime::now(),
-        })
-    }
-
-    fn node_from_path(&self, path: &Path) -> Result<Node, i32> {
-        Ok(self
-            .repo
-            .node_from_path(self.root, path)
-            .map_err(|_| libc::ENOENT)?)
-    }
+pub enum Latest {
+    No,
+    AsLink,
+    AsDir,
 }
 
-fn node_to_filetype(node: &Node) -> FileType {
-    match node.node_type {
-        NodeType::File => FileType::RegularFile,
-        NodeType::Dir => FileType::Directory,
-        NodeType::Symlink { .. } => FileType::Symlink,
-        NodeType::Chardev { .. } => FileType::CharDevice,
-        NodeType::Dev { .. } => FileType::BlockDevice,
-        NodeType::Fifo => FileType::NamedPipe,
-        NodeType::Socket => FileType::Socket,
-    }
+pub enum FsTree {
+    RusticTree(Id),
+    Link(OsString),
+    VirtualTree(BTreeMap<OsString, FsTree>),
 }
 
-fn node_type_to_rdev(tpe: &NodeType) -> u32 {
-    u32::try_from(match tpe {
-        NodeType::Dev { device } => *device,
-        NodeType::Chardev { device } => *device,
-        _ => 0,
-    })
-    .unwrap()
-}
-
-impl<P, S: IndexedFull> FilesystemMT for RusticFS<P, S> {
-    fn getattr(&self, _req: RequestInfo, path: &Path, _fh: Option<u64>) -> ResultEntry {
-        let node = self.node_from_path(path)?;
-        Ok((
-            Duration::from_secs(1),
-            FileAttr {
-                /// Size in bytes
-                size: node.meta.size,
-                /// Size in blocks
-                blocks: 0,
-                // Time of last access
-                atime: node.meta.atime.map(SystemTime::from).unwrap_or(self.now),
-                /// Time of last modification
-                mtime: node.meta.mtime.map(SystemTime::from).unwrap_or(self.now),
-                /// Time of last metadata change
-                ctime: node.meta.ctime.map(SystemTime::from).unwrap_or(self.now),
-                /// Time of creation (macOS only)
-                crtime: self.now,
-                /// Kind of file (directory, file, pipe, etc.)
-                kind: node_to_filetype(&node),
-                /// Permissions
-                perm: node.meta.mode.unwrap_or(0) as u16,
-                /// Number of hard links
-                nlink: node.meta.links.try_into().unwrap_or(1),
-                /// User ID
-                uid: node.meta.uid.unwrap_or(0),
-                /// Group ID
-                gid: node.meta.gid.unwrap_or(0),
-                /// Device ID (if special file)
-                rdev: node_type_to_rdev(&node.node_type),
-                /// Flags (macOS only; see chflags(2))
-                flags: 0,
-            },
-        ))
+impl FsTree {
+    pub fn new() -> Self {
+        Self::VirtualTree(BTreeMap::new())
     }
 
-    #[cfg(not(windows))]
-    fn readlink(&self, _req: RequestInfo, path: &Path) -> ResultData {
-        let node = self.node_from_path(path)?;
-        if node.is_symlink() {
-            let target = node.node_type.to_link().as_os_str().as_bytes();
-            Ok(target.to_vec())
-        } else {
-            Err(libc::ENOSYS)
-        }
-    }
+    pub fn from_snapshots(
+        mut snapshots: Vec<SnapshotFile>,
+        path_template: String,
+        time_template: String,
+        latest_option: Latest,
+        id_snap_option: IdenticalSnapshot,
+    ) -> anyhow::Result<Self> {
+        snapshots.sort_unstable();
+        let mut root = FsTree::new();
 
-    fn open(&self, _req: RequestInfo, path: &Path, _flags: u32) -> ResultOpen {
-        let node = self.node_from_path(path)?;
-        let open = self.repo.open_file(&node).map_err(|_| libc::ENOSYS)?;
-        let mut open_files = self.open_files.write().unwrap();
-        let fh = open_files.last_key_value().map(|(fh, _)| *fh + 1).unwrap_or(0);
-        _ = open_files.insert(fh, open);
-        Ok((fh, 0))
-    }
+        // to handle identical trees
+        let mut last_parent = None;
+        let mut last_name = None;
+        let mut last_tree = Id::default();
 
-    fn release(
-        &self,
-        _req: RequestInfo,
-        _path: &Path,
-        fh: u64,
-        _flags: u32,
-        _lock_owner: u64,
-        _flush: bool,
-    ) -> ResultEmpty {
-        _ = self.open_files.write().unwrap().remove(&fh);
-        Ok(())
-    }
+        // to handle "latest" entries
+        let mut dirs_for_link = BTreeMap::new();
+        let mut dirs_for_snap = BTreeMap::new();
 
-    fn read(
-        &self,
-        _req: RequestInfo,
-        _path: &Path,
-        fh: u64,
-        offset: u64,
-        size: u32,
+        for snap in snapshots {
+            let path = FormatArgs::new(
+                path_template.as_str(),
+                &FormattedSnapshot(&snap, &time_template),
+            )
+            .to_string();
+            let path = Path::new(&path);
+            let filename = path.file_name().map(OsStr::to_os_string);
+            let parent_path = path.parent().map(Path::to_path_buf);
 
-        callback: impl FnOnce(ResultSlice<'_>) -> CallbackResult,
-    ) -> CallbackResult {
-        if let Some(open_file) = self.open_files.read().unwrap().get(&fh) {
-            if let Ok(data) =
-                self.repo
-                    .read_file_at(open_file, offset.try_into().unwrap(), size as usize)
-            {
-                return callback(Ok(&data));
+            // Save pathes for latest entries, if requested
+            if matches!(latest_option, Latest::AsLink) {
+                _ = dirs_for_link.insert(parent_path.clone(), filename.clone());
             }
-        }
-        callback(Err(libc::ENOSYS))
-    }
+            if matches!(latest_option, Latest::AsDir) {
+                _ = dirs_for_snap.insert(parent_path.clone(), snap.tree);
+            }
 
-    fn opendir(&self, _req: RequestInfo, _path: &Path, _flags: u32) -> ResultOpen {
-        Ok((0, 0))
-    }
-
-    fn readdir(&self, _req: RequestInfo, path: &Path, _fh: u64) -> ResultReaddir {
-        let node = self.node_from_path(path)?;
-
-        let tree = self
-            .repo
-            .get_tree(&node.subtree.unwrap())
-            .map_err(|_| libc::ENOSYS)?;
-
-        let result = tree
-            .nodes
-            .into_iter()
-            .map(|node| DirectoryEntry {
-                name: node.name(),
-                kind: node_to_filetype(&node),
-            })
-            .collect();
-        Ok(result)
-    }
-
-    fn releasedir(&self, _req: RequestInfo, _path: &Path, _fh: u64, _flags: u32) -> ResultEmpty {
-        Ok(())
-    }
-
-    fn listxattr(&self, _req: RequestInfo, path: &Path, size: u32) -> ResultXattr {
-        let node = self.node_from_path(path)?;
-        let xattrs = node
-            .meta
-            .extended_attributes
-            .into_iter()
-            // convert into null-terminated [u8]
-            .map(|a| CString::new(a.name).unwrap().into_bytes_with_nul())
-            .concat();
-
-        if size == 0 {
-            Ok(Xattr::Size(u32::try_from(xattrs.len()).unwrap()))
-        } else {
-            Ok(Xattr::Data(xattrs))
-        }
-    }
-
-    fn getxattr(&self, _req: RequestInfo, path: &Path, name: &OsStr, size: u32) -> ResultXattr {
-        let node = self.node_from_path(path)?;
-        match node
-            .meta
-            .extended_attributes
-            .into_iter()
-            .find(|a| name == OsStr::new(&a.name))
-        {
-            None => Err(libc::ENOSYS),
-            Some(attr) => {
-                if size == 0 {
-                    Ok(Xattr::Size(u32::try_from(attr.value.len()).unwrap()))
+            // Create the entry, potentially as symlink if requested
+            if last_parent != parent_path || last_name != filename {
+                if matches!(id_snap_option, IdenticalSnapshot::AsLink)
+                    && last_parent == parent_path
+                    && last_tree == snap.tree
+                {
+                    if let Some(name) = last_name {
+                        root.add_tree(path, FsTree::Link(name))?;
+                    }
                 } else {
-                    Ok(Xattr::Data(attr.value))
+                    root.add_tree(path, FsTree::RusticTree(snap.tree))?;
+                }
+            }
+            last_parent = parent_path;
+            last_name = filename;
+            last_tree = snap.tree;
+        }
+
+        // Add latest entries if requested
+        match latest_option {
+            Latest::No => {}
+            Latest::AsLink => {
+                for (path, target) in dirs_for_link {
+                    if let (Some(mut path), Some(target)) = (path, target) {
+                        path.push("latest");
+                        root.add_tree(&path, FsTree::Link(target))?;
+                    }
+                }
+            }
+            Latest::AsDir => {
+                for (path, tree) in dirs_for_snap {
+                    if let Some(mut path) = path {
+                        path.push("latest");
+                        root.add_tree(&path, FsTree::RusticTree(tree))?;
+                    }
                 }
             }
         }
+        Ok(root)
+    }
+
+    pub fn add_tree(&mut self, path: &Path, new_tree: FsTree) -> anyhow::Result<()> {
+        let mut tree = self;
+        let mut components = path.components();
+        let Component::Normal(last) = components.next_back().unwrap() else {
+            bail!("only normal paths allowed!");
+        };
+
+        for comp in components {
+            if let Component::Normal(name) = comp {
+                match tree {
+                    FsTree::VirtualTree(vtree) => {
+                        tree = vtree
+                            .entry(name.to_os_string())
+                            .or_insert(FsTree::VirtualTree(BTreeMap::new()));
+                    }
+                    _ => {
+                        bail!("dir exists as non-virtual dir")
+                    }
+                }
+            }
+        }
+
+        let FsTree::VirtualTree(vtree) = tree else {
+            bail!("dir exists as non-virtual dir!")
+        };
+
+        _ = vtree.insert(last.to_os_string(), new_tree);
+        Ok(())
+    }
+
+    fn get_path(&self, path: &Path) -> anyhow::Result<(&Self, Option<PathBuf>)> {
+        let mut tree = self;
+        let mut components = path.components();
+        loop {
+            match tree {
+                Self::RusticTree(_) => {
+                    let path: PathBuf = components.collect();
+                    return Ok((tree, Some(path)));
+                }
+                Self::VirtualTree(vtree) => match components.next() {
+                    Some(std::path::Component::Normal(name)) => {
+                        tree = vtree
+                            .get(name)
+                            .ok_or_else(|| anyhow!("name {:?} doesn't exist", name))?;
+                    }
+                    None => {
+                        return Ok((tree, None));
+                    }
+
+                    _ => {}
+                },
+                Self::Link(_) => return Ok((tree, None)),
+            }
+        }
+    }
+
+    pub fn node_from_path<P, S: IndexedFull>(
+        &self,
+        repo: &Repository<P, S>,
+        path: &Path,
+    ) -> anyhow::Result<Node> {
+        let (tree, path) = self.get_path(path)?;
+        let meta = Metadata::default();
+        match tree {
+            Self::RusticTree(tree_id) => {
+                return Ok(repo.node_from_path(*tree_id, &path.unwrap())?);
+            }
+            Self::VirtualTree(_) => {
+                return Ok(Node::new(String::new(), NodeType::Dir, meta, None, None));
+            }
+            Self::Link(target) => {
+                return Ok(Node::new(
+                    String::new(),
+                    NodeType::from_link(Path::new(target)),
+                    meta,
+                    None,
+                    None,
+                ));
+            }
+        }
+    }
+
+    pub fn dir_entries_from_path<P, S: IndexedFull>(
+        &self,
+        repo: &Repository<P, S>,
+        path: &Path,
+    ) -> anyhow::Result<Vec<Node>> {
+        let (tree, path) = self.get_path(path)?;
+
+        let result = match tree {
+            Self::RusticTree(tree_id) => {
+                let node = repo.node_from_path(*tree_id, &path.unwrap())?;
+                if node.is_dir() {
+                    let tree = repo.get_tree(&node.subtree.unwrap())?;
+                    tree.nodes
+                } else {
+                    Vec::new()
+                }
+            }
+            Self::VirtualTree(vtree) => vtree
+                .iter()
+                .map(|(name, tree)| {
+                    let node_type = match tree {
+                        FsTree::Link(target) => NodeType::from_link(Path::new(target)),
+                        _ => NodeType::Dir,
+                    };
+                    Node::new_node(name, node_type, Metadata::default())
+                })
+                .collect(),
+            Self::Link(_) => {
+                bail!("no dir entries for symlink!");
+            }
+        };
+        Ok(result)
     }
 }
