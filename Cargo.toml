@@ -91,6 +91,11 @@ mimalloc = { version = "0.1.39", default_features = false, optional = true }
 rhai = { workspace = true }
 simplelog = { workspace = true }
 runtime-format = "0.1.3"
+webdav-handler = {version = "0.2.0", features = ["warp-compat"]}
+bytes = "1.5.0"
+futures = "0.3.30"
+tokio = "1.35.1"
+warp = "0.3.6"
 
 [dev-dependencies]
 abscissa_core = { workspace = true, features = ["testing"] }

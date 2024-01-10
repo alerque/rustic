@@ -23,6 +23,7 @@ pub(crate) mod self_update;
 pub(crate) mod show_config;
 pub(crate) mod snapshots;
 pub(crate) mod tag;
+pub(crate) mod webdav;
 
 use std::fs::File;
 use std::path::PathBuf;
@@ -35,7 +36,7 @@ use crate::{
         init::InitCmd, key::KeyCmd, list::ListCmd, ls::LsCmd, merge::MergeCmd, mount::MountCmd,
         prune::PruneCmd, repair::RepairCmd, repoinfo::RepoInfoCmd, restore::RestoreCmd,
         self_update::SelfUpdateCmd, show_config::ShowConfigCmd, snapshots::SnapshotCmd,
-        tag::TagCmd,
+        tag::TagCmd, webdav::WebDavCmd,
     },
     config::{progress_options::ProgressOptions, RepoOptions, RusticConfig},
     {Application, RUSTIC_APP},
@@ -129,6 +130,9 @@ enum RusticCmd {
 
     /// Change tags of snapshots
     Tag(TagCmd),
+
+    /// Mount repository
+    Webdav(WebDavCmd),
 }
 
 /// Entry point for the application. It needs to be a struct to allow using subcommands!
