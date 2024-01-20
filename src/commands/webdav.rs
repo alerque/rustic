@@ -1,14 +1,12 @@
 //! `mount` subcommand
-mod webdavfs;
-
 use std::net::SocketAddr;
 use std::str::FromStr;
 
 use crate::{commands::open_repository, status_err, Application, RUSTIC_APP};
 use abscissa_core::{Command, Runnable, Shutdown};
 use anyhow::Result;
+use rustic_core::vfs::{IdenticalSnapshot, Latest, Vfs};
 use webdav_handler::{warp::dav_handler, DavHandler};
-use webdavfs::RusticWebDavFS;
 
 #[derive(clap::Parser, Command, Debug)]
 pub(crate) struct WebDavCmd {
@@ -45,34 +43,35 @@ impl Runnable for WebDavCmd {
 impl WebDavCmd {
     fn inner_run(&self) -> Result<()> {
         let config = RUSTIC_APP.config();
-
-        let repo = open_repository(&config)?.to_indexed()?;
+        let repo = open_repository(&config.repository)?.to_indexed()?;
 
         let path_template = self
             .path_template
             .clone()
-            .unwrap_or("[{hostname}]/[{label}]/{time}".to_string());
+            .unwrap_or_else(|| "[{hostname}]/[{label}]/{time}".to_string());
         let time_template = self
             .time_template
             .clone()
-            .unwrap_or("%Y-%m-%d_%H-%M-%S".to_string());
+            .unwrap_or_else(|| "%Y-%m-%d_%H-%M-%S".to_string());
 
         let sn_filter = |sn: &_| config.snapshot_filter.matches(sn);
-        let target_fs = if let Some(snap) = &self.snap {
+
+        let vfs = if let Some(snap) = &self.snap {
             let node = repo.node_from_snapshot_path(snap, sn_filter)?;
-            RusticWebDavFS::from_node(repo, node)
+            Vfs::from_dirnode(node)
         } else {
             let snapshots = repo.get_matching_snapshots(sn_filter)?;
-            RusticWebDavFS::from_snapshots(
-                repo,
-                snapshots,
-                path_template,
-                time_template,
-                self.symlinks,
-            )?
+            let (latest, identical) = if self.symlinks {
+                (Latest::AsLink, IdenticalSnapshot::AsLink)
+            } else {
+                (Latest::AsDir, IdenticalSnapshot::AsDir)
+            };
+            Vfs::from_snapshots(snapshots, path_template, time_template, latest, identical)?
         };
         let addr = SocketAddr::from_str(&self.socket)?;
-        let dav_server = DavHandler::builder().filesystem(target_fs).build_handler();
+        let dav_server = DavHandler::builder()
+            .filesystem(vfs.into_webdav_fs(repo))
+            .build_handler();
 
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
